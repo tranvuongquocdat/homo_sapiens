@@ -7,6 +7,7 @@ from picamera2 import Picamera2
 import cv2
 import threading
 from queue import Queue
+import socket
 
 class CameraServer:
     def __init__(self, host="0.0.0.0", port=8765, fps=5):
@@ -28,6 +29,59 @@ class CameraServer:
         # Biến để kiểm soát thread
         self.running = False
         self.camera_thread = None
+        
+    def get_local_ips(self):
+        """Lấy tất cả IP addresses của máy (phiên bản đơn giản)"""
+        ips = []
+        
+        try:
+            # Phương pháp đơn giản: kết nối tới Google DNS
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            main_ip = s.getsockname()[0]
+            s.close()
+            ips.append(("WiFi/Ethernet", main_ip))
+        except:
+            try:
+                # Fallback: lấy hostname IP
+                hostname_ip = socket.gethostbyname(socket.gethostname())
+                if hostname_ip != '127.0.0.1':
+                    ips.append(("hostname", hostname_ip))
+            except:
+                pass
+        
+        return ips
+    
+    def display_connection_info(self):
+        """Hiển thị thông tin kết nối"""
+        print("=" * 60)
+        print("🎥 RASPBERRY PI CAMERA SERVER")
+        print("=" * 60)
+        
+        ips = self.get_local_ips()
+        
+        if ips:
+            print("📍 Server đang chạy tại các địa chỉ sau:")
+            print("-" * 40)
+            
+            for interface, ip in ips:
+                print(f"   Interface: {interface}")
+                print(f"   WebSocket URL: ws://{ip}:{self.port}")
+                print(f"   Client Config: SERVER_IP = \"{ip}\"")
+                print("-" * 40)
+            
+            # Hiển thị IP chính (thường là WiFi hoặc Ethernet)
+            main_ip = ips[0][1] if ips else "unknown"
+            print(f"🔗 URL chính để kết nối: ws://{main_ip}:{self.port}")
+            print(f"📝 Cập nhật trong client.py: SERVER_IP = \"{main_ip}\"")
+        else:
+            print("⚠️  Không thể detect IP address!")
+            print(f"   Sử dụng localhost: ws://127.0.0.1:{self.port}")
+        
+        print("=" * 60)
+        print(f"⚙️  Cấu hình: FPS={self.fps}, Resolution=640x480")
+        print("🛑 Nhấn Ctrl+C để dừng server")
+        print("=" * 60)
         
     def capture_frames(self):
         """Thread function để capture frame liên tục"""
@@ -118,7 +172,8 @@ class CameraServer:
     
     async def run_server(self):
         """Async function để chạy server"""
-        print(f"Bắt đầu camera capture với FPS: {self.fps}")
+        # Hiển thị thông tin kết nối
+        self.display_connection_info()
         
         # Bắt đầu camera thread
         self.running = True
