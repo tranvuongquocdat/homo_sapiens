@@ -31,7 +31,7 @@ class CameraServer:
         self.camera_thread = None
         
     def get_local_ips(self):
-        """Lấy tất cả IP addresses của máy (phiên bản đơn giản)"""
+        """Lấy tất cả IP addresses của máy"""
         ips = []
         
         try:
@@ -125,16 +125,14 @@ class CameraServer:
             # Sleep ngắn để không tiêu tốn CPU
             time.sleep(0.01)
     
-    async def handle_client(self, websocket, path):
-        """Xử lý kết nối client"""
+    async def handle_client(self, websocket):
+        """Xử lý kết nối client - CHỈ CẦN 1 PARAMETER"""
         client_address = websocket.remote_address
-        print(f"Client connected: {client_address}")
+        print(f"✅ Client connected: {client_address}")
         
         try:
-            while True:
-                # Chờ request từ client
+            async for message in websocket:
                 try:
-                    message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
                     request = json.loads(message)
                     
                     if request.get("action") == "get_frame":
@@ -155,20 +153,29 @@ class CameraServer:
                         
                         await websocket.send(json.dumps(response))
                         
-                except asyncio.TimeoutError:
-                    # Gửi ping để keep alive
-                    try:
-                        await websocket.ping()
-                    except:
-                        break
+                except json.JSONDecodeError:
+                    error_response = {
+                        "status": "error",
+                        "message": "Invalid JSON format"
+                    }
+                    await websocket.send(json.dumps(error_response))
                 except Exception as e:
                     print(f"Lỗi xử lý message: {e}")
-                    break
+                    error_response = {
+                        "status": "error", 
+                        "message": str(e)
+                    }
+                    try:
+                        await websocket.send(json.dumps(error_response))
+                    except:
+                        break
                     
         except websockets.exceptions.ConnectionClosed:
-            pass
+            print(f"❌ Connection closed: {client_address}")
+        except Exception as e:
+            print(f"❌ Client error: {client_address} - {e}")
         finally:
-            print(f"Client disconnected: {client_address}")
+            print(f"🔄 Client disconnected: {client_address}")
     
     async def run_server(self):
         """Async function để chạy server"""
@@ -181,15 +188,20 @@ class CameraServer:
         self.camera_thread.daemon = True
         self.camera_thread.start()
         
-        # Khởi động WebSocket server
-        print(f"Khởi động WebSocket server tại ws://{self.host}:{self.port}")
-        
         try:
-            async with websockets.serve(self.handle_client, self.host, self.port):
-                print("Server đang chạy... Nhấn Ctrl+C để dừng")
+            # Tạo server với error handling tốt hơn
+            async with websockets.serve(
+                self.handle_client, 
+                self.host, 
+                self.port,
+                ping_interval=20,  # Ping mỗi 20 giây
+                ping_timeout=10,   # Timeout ping sau 10 giây
+                close_timeout=10   # Timeout đóng kết nối sau 10 giây
+            ) as server:
+                print("🚀 Server sẵn sàng nhận kết nối...")
                 await asyncio.Future()  # run forever
-        except KeyboardInterrupt:
-            print("\nDừng server...")
+        except Exception as e:
+            print(f"❌ Lỗi server: {e}")
         finally:
             self.stop_server()
     
@@ -198,7 +210,7 @@ class CameraServer:
         try:
             asyncio.run(self.run_server())
         except KeyboardInterrupt:
-            print("\nDừng server...")
+            print("\n🛑 Server đã dừng")
         finally:
             self.stop_server()
     
@@ -210,10 +222,13 @@ class CameraServer:
             self.camera_thread.join(timeout=2)
         
         if self.picam2:
-            self.picam2.stop()
-            self.picam2.close()
+            try:
+                self.picam2.stop()
+                self.picam2.close()
+            except:
+                pass
         
-        print("Server đã dừng")
+        print("🔄 Tài nguyên đã được giải phóng")
 
 if __name__ == "__main__":
     # Tạo và khởi động server với FPS = 5
