@@ -116,8 +116,8 @@ class CameraServer:
         finally:
             print(f"Client disconnected: {client_address}")
     
-    def start_server(self):
-        """Khởi động server"""
+    async def run_server(self):
+        """Async function để chạy server"""
         print(f"Bắt đầu camera capture với FPS: {self.fps}")
         
         # Bắt đầu camera thread
@@ -128,13 +128,20 @@ class CameraServer:
         
         # Khởi động WebSocket server
         print(f"Khởi động WebSocket server tại ws://{self.host}:{self.port}")
-        start_server = websockets.serve(self.handle_client, self.host, self.port)
-        
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(start_server)
         
         try:
-            loop.run_forever()
+            async with websockets.serve(self.handle_client, self.host, self.port):
+                print("Server đang chạy... Nhấn Ctrl+C để dừng")
+                await asyncio.Future()  # run forever
+        except KeyboardInterrupt:
+            print("\nDừng server...")
+        finally:
+            self.stop_server()
+    
+    def start_server(self):
+        """Khởi động server"""
+        try:
+            asyncio.run(self.run_server())
         except KeyboardInterrupt:
             print("\nDừng server...")
         finally:
