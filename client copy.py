@@ -17,48 +17,59 @@ import uvicorn
 from contextlib import asynccontextmanager
 import io
 
+# ========== GLOBAL VARIABLES ==========
+# WebSocket connection
 websocket_client: Optional['YOLOWebSocketClient'] = None
 detection_active = False
 current_frame = None
-current_annotated_frame = None
+current_annotated_frame = None  # Frame với detection boxes
 detection_results = []
 current_fps = 0.0
 client_thread = None
 
+# Device setup
 device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-print(f"Using device: {device}")
+print(f"🔧 Sử dụng device: {device}")
 
+# YOLO Model
 yolo_model = YOLO('main_model_v2.pt')
 
+# FPS Control
 TARGET_FPS = 5
-FRAME_INTERVAL = 1.0 / TARGET_FPS
+FRAME_INTERVAL = 1.0 / TARGET_FPS  # 0.2 seconds
 
 def get_local_ip():
+    """Lấy IP address chính xác của máy tính"""
     try:
+        # Tạo socket để connect ra ngoài (không thực sự connect)
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
             local_ip = s.getsockname()[0]
         return local_ip
     except Exception:
+        # Fallback method
         hostname = socket.gethostname()
         return socket.gethostbyname(hostname)
 
 def get_all_ip_addresses():
+    """Lấy tất cả IP addresses có thể dùng"""
     import socket
     hostname = socket.gethostname()
     ip_list = []
     
     try:
+        # Primary IP
         primary_ip = get_local_ip()
         ip_list.append(primary_ip)
         
+        # Additional IPs
         for info in socket.getaddrinfo(hostname, None):
             ip = info[4][0]
             if ip not in ip_list and not ip.startswith('127.') and ':' not in ip:
                 ip_list.append(ip)
                 
     except Exception as e:
-        print(f"Error getting IP: {e}")
+        print(f"⚠️ Lỗi lấy IP: {e}")
         ip_list = ["localhost"]
     
     return ip_list
@@ -73,35 +84,39 @@ class YOLOWebSocketClient:
         self.reconnect_delay = 2
         self.connection_stable = False
         
+        # Performance tracking
         self.frame_count = 0
         self.start_time = time.time()
         self.last_frame_time = 0
         
+        # Load YOLO model
         self.load_model()
         
     def load_model(self):
+        """Load YOLO model với device optimization"""
         global yolo_model
         try:
-            print(f"Loading YOLO model from {self.model_path}...")
+            print(f"🔄 Đang load model YOLO từ {self.model_path}...")
             self.model = YOLO(self.model_path)
             self.model.to(device)
             yolo_model = self.model
-            print(f"Model loaded successfully on {device}!")
+            print(f"✅ Model loaded successfully on {device}!")
         except Exception as e:
-            print(f"Error loading model: {e}")
-            print("Using default YOLOv8n...")
+            print(f"⚠️ Lỗi load model: {e}")
+            print("🔄 Sử dụng YOLOv8n mặc định...")
             self.model = YOLO('yolov8n.pt')
             self.model.to(device)
             yolo_model = self.model
     
     def decode_frame(self, frame_base64):
+        """Decode frame từ base64 với error handling"""
         try:
             if not frame_base64:
                 return None
                 
             frame_bytes = base64.b64decode(frame_base64)
             if len(frame_bytes) == 0:
-                print("Empty frame bytes")
+                print("⚠️ Frame bytes rỗng")
                 return None
                 
             nparr = np.frombuffer(frame_bytes, np.uint8)
@@ -110,48 +125,55 @@ class YOLOWebSocketClient:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
             if frame is None:
-                print("cv2.imdecode returned None")
+                print("⚠️ cv2.imdecode trả về None")
                 return None
                 
             return frame
         except Exception as e:
-            print(f"Error decoding frame: {e}")
+            print(f"❌ Lỗi decode frame: {e}")
             return None
     
     def process_frame_yolo(self, frame):
+        """Xử lý frame bằng YOLO và trả về kết quả"""
         global detection_results, current_annotated_frame
         try:
+            # Kiểm tra frame hợp lệ
             if frame is None or frame.size == 0:
-                print("Invalid frame")
+                print("⚠️ Frame không hợp lệ")
                 return frame, []
             
+            # YOLO inference
             results = self.model(frame, conf=0.5, device=device, verbose=False)
             
+            # Extract detected objects - CHỈ LẤY TÊN OBJECT
             detected_objects = []
             if results[0].boxes is not None:
                 for box in results[0].boxes:
                     cls = int(box.cls[0])
                     label = self.model.names[cls]
-                    if label not in detected_objects:
+                    if label not in detected_objects:  # Tránh duplicate
                         detected_objects.append(label)
             
+            # Update global detection results
             detection_results = detected_objects
             
+            # Create annotated frame - với error handling
             try:
                 annotated_frame = results[0].plot()
                 current_annotated_frame = annotated_frame.copy()
             except Exception as plot_error:
-                print(f"Error plotting results: {plot_error}")
+                print(f"⚠️ Lỗi plot results: {plot_error}")
                 annotated_frame = frame.copy()
                 current_annotated_frame = frame.copy()
             
             return annotated_frame, detected_objects
             
         except Exception as e:
-            print(f"Error processing YOLO: {e}")
+            print(f"❌ Lỗi xử lý YOLO: {e}")
             return frame, []
     
     async def request_frame(self):
+        """Request frame từ server với timeout optimization"""
         try:
             if not self.websocket:
                 return None
@@ -159,6 +181,7 @@ class YOLOWebSocketClient:
             request = {"action": "get_frame"}
             await self.websocket.send(json.dumps(request))
             
+            # Timeout ngắn hơn để responsive hơn
             response = await asyncio.wait_for(self.websocket.recv(), timeout=3.0)
             data = json.loads(response)
             
@@ -167,22 +190,24 @@ class YOLOWebSocketClient:
             return None
                 
         except asyncio.TimeoutError:
+            # Không log quá nhiều timeout để tránh spam
             return None
         except websockets.exceptions.ConnectionClosed:
-            print("Connection closed")
+            print("📡 Kết nối bị đóng")
             self.connection_stable = False
             return None
         except Exception as e:
-            print(f"Error requesting frame: {e}")
+            print(f"❌ Lỗi request frame: {e}")
             return None
     
     async def connect_with_retry(self):
+        """Kết nối với exponential backoff"""
         retry_count = 0
         max_retries = 10
         
         while retry_count < max_retries and self.running:
             try:
-                print(f"Connecting to server: {self.server_url} (attempt {retry_count + 1})")
+                print(f"🔄 Kết nối tới server: {self.server_url} (lần {retry_count + 1})")
                 
                 self.websocket = await asyncio.wait_for(
                     websockets.connect(
@@ -190,120 +215,142 @@ class YOLOWebSocketClient:
                         ping_interval=15,
                         ping_timeout=8,
                         close_timeout=5,
-                        max_size=10**7,
+                        max_size=10**7,  # 10MB để handle large frames
                     ), 
                     timeout=8.0
                 )
                 
-                print("WebSocket connection successful!")
+                print("✅ Kết nối WebSocket thành công!")
                 self.connection_stable = True
                 return True
                 
             except Exception as e:
                 retry_count += 1
-                print(f"Connection error (attempt {retry_count}): {e}")
+                print(f"❌ Lỗi kết nối (lần {retry_count}): {e}")
                 
                 if retry_count < max_retries:
                     await asyncio.sleep(self.reconnect_delay)
-                    self.reconnect_delay = min(self.reconnect_delay * 1.2, 8)
+                    self.reconnect_delay = min(self.reconnect_delay * 1.2, 8)  # Exponential backoff
         
         return False
     
     async def run_client(self):
+        """Main client loop với FPS control - KHÔNG DÙNG cv2.imshow()"""
         global detection_active, current_frame, current_fps
         
         self.running = True
         
         while self.running:
+            # Kết nối hoặc reconnect
             if not await self.connect_with_retry():
-                print("Cannot connect to server")
+                print("❌ Không thể kết nối tới server")
                 break
             
             try:
-                self.reconnect_delay = 2
+                self.reconnect_delay = 2  # Reset delay
                 
                 while self.running and self.connection_stable:
                     current_time = time.time()
                     
+                    # FPS Control - chỉ process frame theo interval
                     if current_time - self.last_frame_time >= FRAME_INTERVAL:
+                        # Request frame từ server
                         frame_base64 = await self.request_frame()
                         
                         if frame_base64:
+                            # Decode frame
                             frame = self.decode_frame(frame_base64)
                             
                             if frame is not None:
+                                # Update current frame cho API
                                 current_frame = frame.copy()
                                 
+                                # Xử lý YOLO nếu detection active
                                 if detection_active:
                                     processed_frame, objects = self.process_frame_yolo(frame)
                                     
+                                    # Log detection results thay vì hiển thị
                                     if objects:
-                                        print(f"Detected: {', '.join(objects)}")
+                                        print(f"🎯 Detected: {', '.join(objects)}")
                                     
+                                    # Tính FPS
                                     self.frame_count += 1
                                     elapsed_time = current_time - self.start_time
                                     if elapsed_time >= 1.0:
                                         current_fps = self.frame_count / elapsed_time
                                         self.frame_count = 0
                                         self.start_time = current_time
-                                        print(f"Detection FPS: {current_fps:.2f}")
+                                        print(f"📊 Detection FPS: {current_fps:.2f}")
                                 
                                 self.last_frame_time = current_time
                         else:
+                            # Không có frame - có thể server busy
                             await asyncio.sleep(0.1)
                     else:
+                        # Chờ để maintain FPS
                         await asyncio.sleep(0.05)
                     
             except websockets.exceptions.ConnectionClosed:
-                print("Connection closed by server")
+                print("📡 Kết nối bị đóng bởi server")
                 self.connection_stable = False
                 if self.websocket:
                     self.websocket = None
                     
             except Exception as e:
-                print(f"Client error: {e}")
+                print(f"❌ Lỗi client: {e}")
                 self.connection_stable = False
                 if self.websocket:
                     self.websocket = None
         
+        # Cleanup - KHÔNG CẦN cv2.destroyAllWindows()
         if self.websocket:
             await self.websocket.close()
-        print("WebSocket Client stopped")
+        print("🛑 WebSocket Client đã dừng")
     
     def start_client(self):
+        """Khởi động client trong thread riêng"""
         try:
             asyncio.run(self.run_client())
         except KeyboardInterrupt:
-            print("\nStopping client...")
+            print("\n🛑 Dừng client...")
             self.running = False
 
+# ========== FASTAPI SERVER ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """Khởi tạo và cleanup khi start/stop server"""
     global websocket_client, client_thread
     
-    print("Initializing WebSocket Client...")
-    SERVER_IP = "172.20.10.3"
+    # Startup
+    print("🚀 Khởi tạo WebSocket Client...")
+    SERVER_IP = "172.20.10.3"  # IP của Raspberry Pi
     SERVER_PORT = 8765
     SERVER_URL = f"ws://{SERVER_IP}:{SERVER_PORT}"
     
     websocket_client = YOLOWebSocketClient(SERVER_URL)
     
+    # Chạy client trong thread riêng
     client_thread = threading.Thread(target=websocket_client.start_client)
     client_thread.daemon = True
     client_thread.start()
     
+    # Đợi client connect
     await asyncio.sleep(2)
     
     yield
     
-    print("Stopping WebSocket Client...")
+    # Cleanup
+    print("🛑 Đang dừng WebSocket Client...")
     if websocket_client:
         websocket_client.running = False
 
 app = FastAPI(lifespan=lifespan, title="YOLO Detection API", version="1.0.0")
 
+# ========== WEB STREAMING ENDPOINTS ==========
+
 @app.get("/", response_class=HTMLResponse)
 async def get_web_viewer():
+    """Trang web để xem video stream"""
     html_content = """
     <!DOCTYPE html>
     <html>
@@ -380,8 +427,8 @@ async def get_web_viewer():
     <body>
         <div class="container">
             <div class="header">
-                <h1>YOLO Detection Video Stream</h1>
-                <p>Real-time object detection from Raspberry Pi camera</p>
+                <h1>🎯 YOLO Detection Video Stream</h1>
+                <p>Real-time object detection từ Raspberry Pi camera</p>
             </div>
             
             <div class="video-container">
@@ -389,18 +436,18 @@ async def get_web_viewer():
             </div>
             
             <div class="controls">
-                <button class="btn btn-start" onclick="startDetection()">Start Detection</button>
-                <button class="btn btn-stop" onclick="stopDetection()">Stop Detection</button>
-                <button class="btn btn-refresh" onclick="refreshStatus()">Refresh Status</button>
+                <button class="btn btn-start" onclick="startDetection()">🎯 Bắt đầu Detection</button>
+                <button class="btn btn-stop" onclick="stopDetection()">🛑 Dừng Detection</button>
+                <button class="btn btn-refresh" onclick="refreshStatus()">🔄 Refresh Status</button>
             </div>
             
             <div id="status" class="status">
-                <h3>Status:</h3>
+                <h3>📊 Trạng thái:</h3>
                 <div id="statusContent">Loading...</div>
             </div>
             
             <div class="objects">
-                <h3>Detected Objects:</h3>
+                <h3>🎯 Detected Objects:</h3>
                 <div id="detectedObjects">No objects detected</div>
             </div>
         </div>
@@ -414,9 +461,9 @@ async def get_web_viewer():
                     const data = await response.json();
                     detectionActive = true;
                     updateStatus();
-                    alert('Detection started!');
+                    alert('✅ Detection started!');
                 } catch (error) {
-                    alert('Error starting detection: ' + error);
+                    alert('❌ Error starting detection: ' + error);
                 }
             }
             
@@ -426,9 +473,9 @@ async def get_web_viewer():
                     const data = await response.json();
                     detectionActive = false;
                     updateStatus();
-                    alert('Detection stopped!');
+                    alert('🛑 Detection stopped!');
                 } catch (error) {
-                    alert('Error stopping detection: ' + error);
+                    alert('❌ Error stopping detection: ' + error);
                 }
             }
             
@@ -438,10 +485,10 @@ async def get_web_viewer():
                     const data = await response.json();
                     
                     document.getElementById('statusContent').innerHTML = `
-                        <p><strong>Active:</strong> ${data.active ? 'Yes' : 'No'}</p>
+                        <p><strong>Active:</strong> ${data.active ? '✅ Yes' : '❌ No'}</p>
                         <p><strong>FPS:</strong> ${data.fps}</p>
                         <p><strong>Device:</strong> ${data.device}</p>
-                        <p><strong>Connection:</strong> ${data.connection_stable ? 'Stable' : 'Unstable'}</p>
+                        <p><strong>Connection:</strong> ${data.connection_stable ? '✅ Stable' : '❌ Unstable'}</p>
                     `;
                     
                     const objectsDiv = document.getElementById('detectedObjects');
@@ -459,11 +506,15 @@ async def get_web_viewer():
             
             function refreshStatus() {
                 updateStatus();
+                // Refresh video stream
                 const img = document.getElementById('videoStream');
                 img.src = img.src.split('?')[0] + '?t=' + new Date().getTime();
             }
             
+            // Auto-refresh status every 2 seconds
             setInterval(updateStatus, 2000);
+            
+            // Initial status load
             updateStatus();
         </script>
     </body>
@@ -472,19 +523,23 @@ async def get_web_viewer():
     return HTMLResponse(content=html_content)
 
 def generate_frames():
+    """Generator để stream video frames"""
     global current_frame, current_annotated_frame, detection_active
     
     while True:
         try:
+            # Chọn frame để stream
             if detection_active and current_annotated_frame is not None:
                 frame = current_annotated_frame.copy()
             elif current_frame is not None:
                 frame = current_frame.copy()
             else:
+                # Tạo frame placeholder
                 frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(frame, 'No Video Feed', (200, 240), 
                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
             
+            # Encode frame to JPEG
             ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
             
             if ret:
@@ -492,21 +547,24 @@ def generate_frames():
                 yield (b'--frame\r\n'
                        b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             
-            time.sleep(0.1)
+            time.sleep(0.1)  # Limit streaming FPS
             
         except Exception as e:
-            print(f"Error generating frame: {e}")
+            print(f"❌ Lỗi generate frame: {e}")
             time.sleep(0.5)
 
 @app.get("/video_feed")
 async def video_feed():
+    """MJPEG video stream endpoint"""
     return StreamingResponse(
         generate_frames(),
         media_type="multipart/x-mixed-replace; boundary=frame"
     )
 
+# ========== EXISTING API ENDPOINTS ==========
 @app.post("/detect")
 async def start_detection():
+    """Bắt đầu YOLO detection"""
     global detection_active
     
     try:
@@ -515,6 +573,7 @@ async def start_detection():
         
         detection_active = True
         
+        # Đợi một frame để có kết quả
         await asyncio.sleep(0.5)
         
         return {
@@ -531,6 +590,7 @@ async def start_detection():
 
 @app.post("/stop")
 async def stop_detection():
+    """Dừng YOLO detection"""
     global detection_active, detection_results, current_fps
     
     try:
@@ -548,6 +608,7 @@ async def stop_detection():
 
 @app.get("/status")
 async def get_status():
+    """Lấy trạng thái detection hiện tại"""
     connection_status = websocket_client.connection_stable if websocket_client else False
     
     return {
@@ -562,6 +623,7 @@ async def get_status():
 
 @app.get("/test")
 async def test_connection():
+    """Test kết nối và hệ thống"""
     return {
         "status": "connected",
         "device": device,
@@ -574,12 +636,14 @@ async def test_connection():
 
 @app.get("/frame")
 async def get_current_frame():
+    """Lấy frame hiện tại (base64)"""
     global current_frame
     
     if current_frame is None:
         raise HTTPException(status_code=404, detail="No frame available")
     
     try:
+        # Encode frame to base64
         _, buffer = cv2.imencode('.jpg', current_frame)
         frame_base64 = base64.b64encode(buffer).decode('utf-8')
         
@@ -592,51 +656,54 @@ async def get_current_frame():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ========== MAIN ==========
 if __name__ == "__main__":
     print(f"\n{'='*60}")
-    print(f"YOLO DETECTION CLIENT & WEB STREAMING API")
+    print(f"🎯 YOLO DETECTION CLIENT & WEB STREAMING API")
     print(f"{'='*60}")
-    print(f"PyTorch: {torch.__version__}")
-    print(f"Device: {device}")
-    print(f"Target FPS: {TARGET_FPS}")
-    print(f"YOLO Model: main_model_v2.pt")
+    print(f"🔧 PyTorch: {torch.__version__}")
+    print(f"🔧 Device: {device}")
+    print(f"🔧 Target FPS: {TARGET_FPS}")
+    print(f"🔧 YOLO Model: main_model_v2.pt")
     
+    # Lấy IP addresses
     primary_ip = get_local_ip()
     all_ips = get_all_ip_addresses()
     
-    print(f"\n{'NETWORK INFORMATION':^60}")
+    print(f"\n{'🌐 NETWORK INFORMATION':^60}")
     print(f"{'='*60}")
-    print(f"Primary IP: {primary_ip}")
+    print(f"📡 Primary IP: {primary_ip}")
     
     if len(all_ips) > 1:
-        print(f"Alternative IPs:")
+        print(f"📡 Alternative IPs:")
         for ip in all_ips[1:]:
             print(f"   • {ip}")
     
-    print(f"\n{'WEB VIDEO STREAMING':^60}")
+    print(f"\n{'🌐 WEB VIDEO STREAMING':^60}")
     print(f"{'='*60}")
-    print(f"Web Viewer: http://{primary_ip}:8000")
-    print(f"Video Stream: http://{primary_ip}:8000/video_feed")
-    print(f"Open browser and visit the link above to view video!")
+    print(f"🔗 Web Viewer: http://{primary_ip}:8000")
+    print(f"📺 Video Stream: http://{primary_ip}:8000/video_feed")
+    print(f"🎮 Mở trình duyệt và truy cập link trên để xem video!")
     
-    print(f"\n{'API ENDPOINTS':^60}")
+    print(f"\n{'📱 API ENDPOINTS':^60}")
     print(f"{'='*60}")
-    print(f"API Endpoints:")
-    print(f"   • POST /detect  - Start detection")
-    print(f"   • POST /stop    - Stop detection") 
-    print(f"   • GET /status   - View status")
+    print(f"📋 API Endpoints:")
+    print(f"   • POST /detect  - Bắt đầu detection")
+    print(f"   • POST /stop    - Dừng detection") 
+    print(f"   • GET /status   - Xem trạng thái")
     print(f"   • GET /test     - Test connection")
-    print(f"   • GET /frame    - Get current frame")
+    print(f"   • GET /frame    - Lấy frame hiện tại")
     
-    print(f"\n{'RASPBERRY PI CONNECTION':^60}")
+    print(f"\n{'🤖 RASPBERRY PI CONNECTION':^60}")
     print(f"{'='*60}")
-    print(f"WebSocket will connect to: ws://172.20.10.3:8765")
-    print(f"Receiving video stream from PiCamera2")
+    print(f"🔗 WebSocket sẽ kết nối tới: ws://172.20.10.3:8765")
+    print(f"📷 Nhận video stream từ PiCamera2")
     
-    print(f"\n{'STARTING SERVER':^60}")
+    print(f"\n{'🚀 STARTING SERVER':^60}")
     print(f"{'='*60}")
-    print(f"Starting Web Streaming Server on port 8000...")
-    print(f"Press Ctrl+C to stop server")
+    print(f"⏳ Khởi động Web Streaming Server trên cổng 8000...")
+    print(f"📝 Nhấn Ctrl+C để dừng server")
     print(f"{'='*60}\n")
     
+    # Chạy FastAPI server
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
